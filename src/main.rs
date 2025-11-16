@@ -1,32 +1,45 @@
-use actix_web::{post, web, App, HttpResponse, HttpServer, Responder};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::path::{Path, PathBuf};
-use printers::{self, common::base::job::PrinterJobOptions};
-use anyhow::{Result, Context, bail}; 
+use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use anyhow::{bail, Context, Result};
 use lopdf::content::{Content, Operation};
-use lopdf::Document;
-use lopdf::Object;
+use lopdf::{Document, Object};
+use printers::{self, common::base::job::PrinterJobOptions};
+use serde::{Deserialize, Serialize};
+
+use std::ffi::OsString;
+use std::path::Path;
+use std::sync::mpsc;
+use std::time::Duration;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
+use windows_service::{
+    define_windows_service,
+    service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    },
+    service_control_handler::{self, ServiceControlHandlerResult},
+    service_dispatcher,
+};
+
+const SERVICE_NAME: &str = "rust-print-api";
+const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 // --- ค่าคงที่สำหรับขนาดกระดาษในหน่วย PostScript Points (1 point = 1/72 inch) ---
 
 // A6: 105mm x 148mm
-const A6_WIDTH_PTS: f32 = 297.64; 
-const A6_HEIGHT_PTS: f32 = 419.53; 
+const A6_WIDTH_PTS: f32 = 297.64;
+const A6_HEIGHT_PTS: f32 = 419.53;
 
 // A4: 210mm x 297mm (ใช้เป็นขนาดอ้างอิงของเอกสารต้นฉบับ)
-const A4_WIDTH_PTS: f32 = 595.28; 
-const A4_HEIGHT_PTS: f32 = 841.89; 
-
+const A4_WIDTH_PTS: f32 = 595.28;
+const A4_HEIGHT_PTS: f32 = 841.89;
 
 /// โครงสร้างสำหรับรับข้อมูลจาก HTTP Request (JSON)
-#[derive(Deserialize, ToSchema)] 
+#[derive(Deserialize, ToSchema)]
 #[schema(example = json!({"filename": "invoice_original.pdf", "printer_name": "Office_LaserJet"}))]
 struct PrintRequest {
-    /// ชื่อไฟล์ PDF ต้นฉบับที่จะค้นหาในโฟลเดอร์ ./printable_files 
-    filename: String, 
+    /// ชื่อไฟล์ PDF ต้นฉบับที่จะค้นหาในโฟลเดอร์ ./printable_files
+    filename: String,
     /// ชื่อเครื่องพิมพ์ปลายทางที่ติดตั้งในระบบ
     printer_name: String,
 }
@@ -37,7 +50,6 @@ struct ResponseMessage {
     status: String,
     message: String,
 }
-
 
 // ----------------------------------------------------------------------
 //                        PDF RESIZING LOGIC (WITH SCALING)
@@ -61,8 +73,10 @@ fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
         // Modify MediaBox
         if let Ok(page) = doc.get_dictionary_mut(page_id) {
             let new_media_box = vec![
-                Object::Real(0.0), Object::Real(0.0),
-                Object::Real(A6_WIDTH_PTS), Object::Real(A6_HEIGHT_PTS),
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(A6_WIDTH_PTS),
+                Object::Real(A6_HEIGHT_PTS),
             ];
             page.set("MediaBox", Object::Array(new_media_box));
         }
@@ -71,14 +85,17 @@ fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
         let content_data = doc.get_page_content(page_id)?;
         let mut content = Content::decode(&content_data)?;
 
-        let matrix_op = Operation::new("cm", vec![
-            Object::Real(scale_factor),
-            Object::Real(0.0),
-            Object::Real(0.0),
-            Object::Real(scale_factor),
-            Object::Real(0.0),
-            Object::Real(0.0),
-        ]);
+        let matrix_op = Operation::new(
+            "cm",
+            vec![
+                Object::Real(scale_factor),
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(scale_factor),
+                Object::Real(0.0),
+                Object::Real(0.0),
+            ],
+        );
         content.operations.insert(0, matrix_op);
 
         let new_content = content.encode()?;
@@ -91,7 +108,6 @@ fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-
 // ----------------------------------------------------------------------
 //                           API HANDLER (UPDATED)
 // ----------------------------------------------------------------------
@@ -99,12 +115,26 @@ fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
 /// กำหนดโครงสร้างเอกสาร OpenAPI
 #[derive(OpenApi)]
 #[openapi(
-    paths(print_file_handler),
+    paths(print_file_handler, index),
     components(schemas(PrintRequest, ResponseMessage)),
     tags((name = "Printing", description = "Endpoints สำหรับการดำเนินการสั่งพิมพ์ไฟล์และแปลงขนาด"))
 )]
 struct ApiDoc;
 
+#[utoipa::path(
+    get,
+    path = "/",
+    responses(
+        (status = 200, description = "Service status", body = ResponseMessage)
+    )
+)]
+#[get("/")]
+async fn index() -> HttpResponse {
+    HttpResponse::Ok().json(ResponseMessage {
+        status: "success".to_string(),
+        message: "Service is running!".to_string(),
+    })
+}
 
 #[utoipa::path(
     post,
@@ -119,9 +149,9 @@ struct ApiDoc;
 )]
 #[post("/api/print")]
 async fn print_file_handler(req: web::Json<PrintRequest>) -> impl Responder {
-    let base_dir = Path::new("./printable_files"); 
+    let base_dir = Path::new("./printable_files");
     let original_file_path = base_dir.join(&req.filename);
-    
+
     // --- โค้ดที่เปลี่ยน: สร้างชื่อไฟล์ A6 ถาวร โดยมี _a6 ต่อท้าย ---
     let original_filename = &req.filename;
     let a6_filename = original_filename.rfind('.').map_or_else(
@@ -129,46 +159,39 @@ async fn print_file_handler(req: web::Json<PrintRequest>) -> impl Responder {
         |i| {
             let (name, ext) = original_filename.split_at(i);
             format!("{}_a6{}", name, ext) // กรณีมีนามสกุล เช่น "invoice.pdf" -> "invoice_a6.pdf"
-        }
+        },
     );
     let a6_file_path = base_dir.join(&a6_filename);
     // ---------------------------------------------------------------------
 
     if !original_file_path.exists() {
-        return HttpResponse::BadRequest().json(
-             ResponseMessage { 
-                status: "error".to_string(), 
-                message: format!("File not found: {}", req.filename) 
-            }
-        );
+        return HttpResponse::BadRequest().json(ResponseMessage {
+            status: "error".to_string(),
+            message: format!("File not found: {}", req.filename),
+        });
     }
-    
+
     // 1. แปลงขนาด PDF เป็น A6 และบันทึกไฟล์ใหม่
     match resize_pdf_to_a6(&original_file_path, &a6_file_path) {
         Ok(_) => println!("PDF successfully resized and saved as {}", a6_filename),
         Err(e) => {
             eprintln!("Error resizing PDF: {:?}", e);
-            return HttpResponse::InternalServerError().json(
-                 ResponseMessage { 
-                    status: "error".to_string(), 
-                    message: format!("Failed to resize PDF to A6: {}", e) 
-                }
-            );
+            return HttpResponse::InternalServerError().json(ResponseMessage {
+                status: "error".to_string(),
+                message: format!("Failed to resize PDF to A6: {}", e),
+            });
         }
     }
 
-    // 2. อ่านไฟล์ A6 ที่สร้างขึ้นใหม่ และสั่งพิมพ์
     // 2. อ่านไฟล์ A6 ที่สร้างขึ้นใหม่ และสั่งพิมพ์
     let file_data = match std::fs::read(&a6_file_path) {
         Ok(data) => data,
         Err(e) => {
             eprintln!("Error reading A6 file {}: {:?}", a6_filename, e);
-            return HttpResponse::InternalServerError().json(
-                 ResponseMessage {
-                    status: "error".to_string(),
-                    message: format!("Failed to read A6 file {}. Error: {}", a6_filename, e)
-                }
-            );
+            return HttpResponse::InternalServerError().json(ResponseMessage {
+                status: "error".to_string(),
+                message: format!("Failed to read A6 file {}. Error: {}", a6_filename, e),
+            });
         }
     };
 
@@ -177,68 +200,140 @@ async fn print_file_handler(req: web::Json<PrintRequest>) -> impl Responder {
     let printer = match printers::get_printer_by_name(&req.printer_name) {
         Some(p) => p,
         None => {
-            return HttpResponse::BadRequest().json(
-                 ResponseMessage {
-                    status: "error".to_string(),
-                    message: format!("Printer not found: {}", req.printer_name)
-                }
-            );
+            return HttpResponse::BadRequest().json(ResponseMessage {
+                status: "error".to_string(),
+                message: format!("Printer not found: {}", req.printer_name),
+            });
         }
     };
 
-                            let options = PrinterJobOptions {
+    let options = PrinterJobOptions {
+        name: Some(&format!("A6 Print Job - {}", req.filename)),
+        raw_properties: &[],
+    };
 
-                                name: Some(&format!("A6 Print Job - {}", req.filename)),
-
-                                raw_properties: &[],
-
-                            };
-
-                match printer.print(&file_data, options) {
+    match printer.print(&file_data, options) {
         Ok(_) => {
             println!("Print job sent successfully to {}", req.printer_name);
-            HttpResponse::Ok().json(
-                 ResponseMessage {
-                    status: "success".to_string(),
-                    message: format!("Resized to A6, saved as {}, and sent to printer {}", a6_filename, req.printer_name)
-                }
-            )
+            HttpResponse::Ok().json(ResponseMessage {
+                status: "success".to_string(),
+                message: format!(
+                    "Resized to A6, saved as {}, and sent to printer {}",
+                    a6_filename, req.printer_name
+                ),
+            })
         }
         Err(e) => {
             eprintln!("Error sending print job: {:?}", e);
-            HttpResponse::InternalServerError().json(
-                 ResponseMessage {
-                    status: "error".to_string(),
-                    message: format!("Failed to send print job: {:?}", e)
-                }
-            )
+            HttpResponse::InternalServerError().json(ResponseMessage {
+                status: "error".to_string(),
+                message: format!("Failed to send print job: {:?}", e),
+            })
         }
     }
 }
 
-
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn run_app() -> std::io::Result<()> {
     let base_dir = Path::new("./printable_files");
     if !base_dir.exists() {
         std::fs::create_dir(base_dir)?;
         println!("Created directory: ./printable_files");
     }
 
-    let openapi = ApiDoc::openapi();
+    let openapi = web::Data::new(ApiDoc::openapi());
 
     println!("Starting server at http://127.0.0.1:8080");
     println!("Swagger UI available at: http://127.0.0.1:8080/swagger-ui/");
 
     HttpServer::new(move || {
         App::new()
+            .app_data(openapi.clone())
+            .service(index)
             .service(print_file_handler)
             .service(
                 SwaggerUi::new("/swagger-ui/{_:.*}")
-                    .url("/api-docs/openapi.json", openapi.clone())
+                    .url("/api-docs/openapi.json", openapi.get_ref().clone()),
             )
     })
     .bind(("127.0.0.1", 8080))?
     .run()
     .await
+}
+
+fn my_service_main(_arguments: Vec<OsString>) {
+    if let Err(e) = run_service() {
+        eprintln!("Failed to run service: {}", e);
+    }
+}
+
+fn run_service() -> windows_service::Result<()> {
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+
+    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        match control_event {
+            ServiceControl::Stop => {
+                shutdown_tx.send(()).unwrap();
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+
+    let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
+
+    status_handle.set_service_status(ServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    })?;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    std::thread::spawn(move || {
+        rt.block_on(async {
+            if let Err(e) = run_app().await {
+                eprintln!("Server failed to start: {}", e);
+            }
+        });
+    });
+
+    loop {
+        match shutdown_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(_) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => (),
+            Err(_) => break,
+        }
+    }
+
+    status_handle.set_service_status(ServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    })?;
+
+    Ok(())
+}
+
+define_windows_service!(ffi_service_main, my_service_main);
+
+fn main() -> windows_service::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--console" {
+        // Run in console mode
+        if let Err(e) = tokio::runtime::Runtime::new().unwrap().block_on(run_app()) {
+            eprintln!("Failed to run in console mode: {}", e);
+        }
+    } else {
+        // Run as a service
+        service_dispatcher::start(SERVICE_NAME, ffi_service_main)?;
+    }
+    Ok(())
 }
