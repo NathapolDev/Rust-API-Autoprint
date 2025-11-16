@@ -10,6 +10,6 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 printers = "2.2.0"
 anyhow = "1.0" 
-lopdf = "0.30" 
+lopdf = "0.38.0" 
 utoipa = { version = "4.2.0", features = ["actix_extras"] } 
 utoipa-swagger-ui = { version = "7.1.0", features = ["actix-web"] }

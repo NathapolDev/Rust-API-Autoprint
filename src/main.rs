@@ -53,59 +53,38 @@ fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
     let scale_y = A6_HEIGHT_PTS / A4_HEIGHT_PTS;
     let scale_factor = scale_x.min(scale_y);
 
-    if scale_factor > 1.0 { 
+    if scale_factor > 1.0 {
         bail!("Scaling up is not handled, only scaling down to A6.");
     }
 
-        let pages_to_process: Vec<(lopdf::ObjectId, lopdf::ObjectId)> = doc.get_pages()
-            .values()
-            .filter_map(|page_id| {
-                doc.get_dictionary(*page_id).ok().and_then(|page| {
-                    if let Ok(Object::Reference(content_ref)) = page.get(b"Contents") {
-                        Some((*page_id, *content_ref))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-    
-        for (page_id, content_ref) in pages_to_process {
-            // Modify MediaBox
-            if let Ok(page) = doc.get_dictionary_mut(page_id) {
-                let new_media_box = vec![
-                    Object::Real(0.0), Object::Real(0.0),
-                    Object::Real(A6_WIDTH_PTS), Object::Real(A6_HEIGHT_PTS),
-                ];
-                page.set("MediaBox", Object::Array(new_media_box));
-            }
-    
-            // Modify content stream
-            if let Ok(content_stream) = doc.get_object(content_ref).and_then(|obj| obj.as_stream()) {
-                let mut content = Content::decode(&content_stream.content)?;
-    
-                let matrix_op = Operation::new("cm", vec![
-                    Object::Real(scale_factor),
-                    Object::Real(0.0),
-                    Object::Real(0.0),
-                    Object::Real(scale_factor),
-                    Object::Real(0.0),
-                    Object::Real(0.0),
-                ]);
-                content.operations.insert(0, matrix_op);
-    
-                let new_content_bytes = content.encode()?;
-                let new_stream = lopdf::Stream {
-                    dict: content_stream.dict.clone(),
-                    content: new_content_bytes,
-                    allows_compression: content_stream.allows_compression,
-                    start_position: content_stream.start_position,
-                };
-                doc.objects.insert(content_ref, Object::Stream(new_stream));
-            }
+    for (_, page_id) in doc.get_pages() {
+        // Modify MediaBox
+        if let Ok(page) = doc.get_dictionary_mut(page_id) {
+            let new_media_box = vec![
+                Object::Real(0.0), Object::Real(0.0),
+                Object::Real(A6_WIDTH_PTS), Object::Real(A6_HEIGHT_PTS),
+            ];
+            page.set("MediaBox", Object::Array(new_media_box));
         }
-    // 4. บันทึกเอกสาร A6 ใหม่
-    doc.prune_objects();
+
+        // Modify content stream
+        let content_data = doc.get_page_content(page_id)?;
+        let mut content = Content::decode(&content_data)?;
+
+        let matrix_op = Operation::new("cm", vec![
+            Object::Real(scale_factor),
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(scale_factor),
+            Object::Real(0.0),
+            Object::Real(0.0),
+        ]);
+        content.operations.insert(0, matrix_op);
+
+        let new_content = content.encode()?;
+        doc.change_page_content(page_id, new_content)?;
+    }
+
     doc.save(output_path)
         .context(format!("Failed to save new A6 PDF file: {}", output_path.display()))?;
 
