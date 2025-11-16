@@ -125,15 +125,70 @@ struct ApiDoc;
     get,
     path = "/",
     responses(
-        (status = 200, description = "Service status", body = ResponseMessage)
+        (status = 200, description = "Service status", body = String, content_type = "text/html")
     )
 )]
 #[get("/")]
 async fn index() -> HttpResponse {
-    HttpResponse::Ok().json(ResponseMessage {
-        status: "success".to_string(),
-        message: "Service is running!".to_string(),
-    })
+    let html_content = r#"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rust Print API Status</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #282c34; /* Dark background */
+            color: #ffffff; /* White text */
+            text-align: center;
+        }
+        .status-message {
+            font-size: 2.5em;
+            margin-bottom: 40px;
+            color: #61dafb; /* React blue */
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+        }
+        .logo-container {
+            margin-top: 20px;
+        }
+        .logo-text {
+            font-family: 'Fira Code', monospace; /* A cool monospace font */
+            font-size: 6em;
+            font-weight: bold;
+            color: #dea584; /* Rust orange */
+            text-shadow: 4px 4px 8px rgba(0, 0, 0, 0.7);
+            animation: pulse 2s infinite alternate;
+        }
+        .sub-logo-text {
+            font-size: 2em;
+            color: #f0db4f; /* JavaScript yellow, for "Print API" */
+            margin-top: -20px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+        }
+        @keyframes pulse {
+            from { transform: scale(1); }
+            to { transform: scale(1.05); }
+        }
+    </style>
+</head>
+<body>
+    <div class="status-message">Service Status: Running</div>
+    <div class="logo-container">
+        <div class="logo-text">Rust</div>
+        <div class="sub-logo-text">Print API</div>
+    </div>
+</body>
+</html>
+    "#.to_string();
+    HttpResponse::Ok().content_type("text/html").body(html_content)
 }
 
 #[utoipa::path(
