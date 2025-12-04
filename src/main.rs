@@ -51,6 +51,13 @@ struct ResponseMessage {
     message: String,
 }
 
+/// โครงสร้างสำหรับ Response รายการเครื่องพิมพ์
+#[derive(Serialize, ToSchema)]
+struct PrinterListResponse {
+    status: String,
+    printers: Vec<String>,
+}
+
 // ----------------------------------------------------------------------
 //                        PDF RESIZING LOGIC (WITH SCALING)
 // ----------------------------------------------------------------------
@@ -115,11 +122,32 @@ fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
 /// กำหนดโครงสร้างเอกสาร OpenAPI
 #[derive(OpenApi)]
 #[openapi(
-    paths(print_file_handler, index),
-    components(schemas(PrintRequest, ResponseMessage)),
+    paths(print_file_handler, get_printers, index),
+    components(schemas(PrintRequest, ResponseMessage, PrinterListResponse)),
     tags((name = "Printing", description = "Endpoints สำหรับการดำเนินการสั่งพิมพ์ไฟล์และแปลงขนาด"))
 )]
 struct ApiDoc;
+
+#[utoipa::path(
+    get,
+    path = "/api/printers",
+    tag = "Printing",
+    responses(
+        (status = 200, description = "รายการเครื่องพิมพ์ทั้งหมดที่พร้อมใช้งาน", body = PrinterListResponse)
+    )
+)]
+#[get("/api/printers")]
+async fn get_printers() -> impl Responder {
+    let printers: Vec<String> = printers::get_printers()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+
+    HttpResponse::Ok().json(PrinterListResponse {
+        status: "success".to_string(),
+        printers,
+    })
+}
 
 #[utoipa::path(
     get,
@@ -297,20 +325,21 @@ async fn run_app() -> std::io::Result<()> {
 
     let openapi = web::Data::new(ApiDoc::openapi());
 
-    println!("Starting server at http://127.0.0.1:8080");
-    println!("Swagger UI available at: http://127.0.0.1:8080/swagger-ui/");
+    println!("Starting server at http://127.0.0.1:3000");
+    println!("Swagger UI available at: http://127.0.0.1:3000/swagger-ui/");
 
     HttpServer::new(move || {
         App::new()
             .app_data(openapi.clone())
             .service(index)
+            .service(get_printers)
             .service(print_file_handler)
             .service(
                 SwaggerUi::new("/swagger-ui/{_:.*}")
                     .url("/api-docs/openapi.json", openapi.get_ref().clone()),
             )
     })
-    .bind(("127.0.0.1", 8080))?
+    .bind(("127.0.0.1", 3000))?
     .run()
     .await
 }
