@@ -138,9 +138,38 @@ struct ApiDoc;
 )]
 #[get("/api/printers")]
 async fn get_printers() -> impl Responder {
+    // List of common virtual/software printer keywords to filter out
+    let virtual_printer_keywords = [
+        "microsoft print to pdf",
+        "microsoft xps",
+        "onenote",
+        "fax",
+        "send to onenote",
+        "adobe pdf",
+        "foxit",
+        "nitro pdf",
+        "cutepdf",
+        "pdf creator",
+        "pdfwriter",
+        "novapdf",
+        "bullzip",
+        "dopdf",
+        "primopdf",
+        "pdf24",
+        "microsoft to pdf",
+        "send to microsoft",
+        "xps document writer",
+        "note writer",
+    ];
+
     let printers: Vec<String> = printers::get_printers()
         .into_iter()
         .map(|p| p.name)
+        .filter(|name| {
+            let name_lower = name.to_lowercase();
+            // Filter out printers that contain any of the virtual printer keywords
+            !virtual_printer_keywords.iter().any(|keyword| name_lower.contains(keyword))
+        })
         .collect();
 
     HttpResponse::Ok().json(PrinterListResponse {
@@ -166,6 +195,11 @@ async fn index() -> HttpResponse {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Rust Print API Status</title>
     <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             display: flex;
@@ -173,46 +207,216 @@ async fn index() -> HttpResponse {
             justify-content: center;
             align-items: center;
             min-height: 100vh;
-            margin: 0;
-            background-color: #282c34; /* Dark background */
-            color: #ffffff; /* White text */
+            padding: 20px;
+            background: linear-gradient(135deg, #1e1e2e 0%, #282c34 100%);
+            color: #ffffff;
             text-align: center;
         }
+        .container {
+            max-width: 1200px;
+            width: 100%;
+        }
         .status-message {
-            font-size: 2.5em;
-            margin-bottom: 40px;
-            color: #61dafb; /* React blue */
+            font-size: 2em;
+            margin-bottom: 20px;
+            color: #61dafb;
             text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
         }
         .logo-container {
-            margin-top: 20px;
+            margin-bottom: 40px;
         }
         .logo-text {
-            font-family: 'Fira Code', monospace; /* A cool monospace font */
-            font-size: 6em;
+            font-family: 'Fira Code', monospace;
+            font-size: 5em;
             font-weight: bold;
-            color: #dea584; /* Rust orange */
+            color: #dea584;
             text-shadow: 4px 4px 8px rgba(0, 0, 0, 0.7);
             animation: pulse 2s infinite alternate;
         }
         .sub-logo-text {
-            font-size: 2em;
-            color: #f0db4f; /* JavaScript yellow, for "Print API" */
-            margin-top: -20px;
+            font-size: 1.8em;
+            color: #f0db4f;
+            margin-top: -10px;
             text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
         }
         @keyframes pulse {
             from { transform: scale(1); }
             to { transform: scale(1.05); }
         }
+        .printers-section {
+            margin-top: 40px;
+            width: 100%;
+        }
+        .section-title {
+            font-size: 1.8em;
+            color: #61dafb;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+        .printer-icon {
+            font-size: 1.2em;
+        }
+        .printers-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .printer-card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 2px solid rgba(97, 218, 251, 0.3);
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+        }
+        .printer-card:hover {
+            transform: translateY(-5px);
+            border-color: #61dafb;
+            box-shadow: 0 8px 20px rgba(97, 218, 251, 0.3);
+        }
+        .printer-name {
+            font-size: 1.1em;
+            color: #ffffff;
+            word-break: break-word;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        .loading {
+            color: #f0db4f;
+            font-size: 1.2em;
+            animation: blink 1.5s infinite;
+        }
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .error {
+            color: #ff6b6b;
+            padding: 20px;
+            background: rgba(255, 107, 107, 0.1);
+            border-radius: 8px;
+            border: 1px solid rgba(255, 107, 107, 0.3);
+        }
+        .no-printers {
+            color: #f0db4f;
+            padding: 20px;
+            background: rgba(240, 219, 79, 0.1);
+            border-radius: 8px;
+            border: 1px solid rgba(240, 219, 79, 0.3);
+        }
+        .api-links {
+            margin-top: 40px;
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        .api-link {
+            padding: 12px 24px;
+            background: rgba(97, 218, 251, 0.1);
+            border: 2px solid #61dafb;
+            border-radius: 8px;
+            color: #61dafb;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            font-weight: 600;
+        }
+        .api-link:hover {
+            background: #61dafb;
+            color: #282c34;
+            transform: scale(1.05);
+        }
+        .footer {
+            margin-top: 60px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            color: #8b949e;
+            font-size: 0.9em;
+            line-height: 1.6;
+        }
+        .company-name {
+            color: #dea584;
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
-    <div class="status-message">Service Status: Running</div>
-    <div class="logo-container">
-        <div class="logo-text">Rust</div>
-        <div class="sub-logo-text">Print API</div>
+    <div class="container">
+        <div class="status-message">🟢 Service Status: Running</div>
+        <div class="logo-container">
+            <div class="logo-text">Rust</div>
+            <div class="sub-logo-text">Print API</div>
+        </div>
+
+        <div class="printers-section">
+            <h2 class="section-title">
+                <span class="printer-icon">🖨️</span>
+                Available Printers
+            </h2>
+            <div id="printers-container">
+                <div class="loading">Loading printers...</div>
+            </div>
+        </div>
+
+        <div class="api-links">
+            <a href="/swagger-ui/" class="api-link">📚 API Documentation</a>
+            <a href="/api/printers" class="api-link">📋 Printers JSON</a>
+        </div>
+
+        <div class="footer">
+            <p>Copyright &copy; 2025 <span class="company-name">Bhatara Progress Co., Ltd.</span></p>
+            <p>Developed by Bhatara Progress Co., Ltd.</p>
+        </div>
     </div>
+
+    <script>
+        async function loadPrinters() {
+            const container = document.getElementById('printers-container');
+            try {
+                const response = await fetch('/api/printers');
+                const data = await response.json();
+                
+                if (data.status === 'success' && data.printers && data.printers.length > 0) {
+                    const grid = document.createElement('div');
+                    grid.className = 'printers-grid';
+                    
+                    data.printers.forEach(printer => {
+                        const card = document.createElement('div');
+                        card.className = 'printer-card';
+                        card.innerHTML = `
+                            <div class="printer-name">
+                                <span>🖨️</span>
+                                <span>${escapeHtml(printer)}</span>
+                            </div>
+                        `;
+                        grid.appendChild(card);
+                    });
+                    
+                    container.innerHTML = '';
+                    container.appendChild(grid);
+                } else {
+                    container.innerHTML = '<div class="no-printers">No printers found on this system</div>';
+                }
+            } catch (error) {
+                container.innerHTML = `<div class="error">Failed to load printers: ${escapeHtml(error.message)}</div>`;
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Load printers when page loads
+        loadPrinters();
+    </script>
 </body>
 </html>
     "#.to_string();
