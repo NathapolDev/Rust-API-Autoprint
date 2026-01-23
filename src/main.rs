@@ -447,85 +447,129 @@ async fn index() -> HttpResponse {
 )]
 #[post("/api/print")]
 async fn print_file_handler(req: web::Json<PrintRequest>) -> impl Responder {
-    let base_dir = Path::new("./printable_files");
-    let original_file_path = base_dir.join(&req.filename);
+    let filename = req.filename.clone();
+    let printer_name = req.printer_name.clone();
 
-    // --- โค้ดที่เปลี่ยน: สร้างชื่อไฟล์ A6 ถาวร โดยมี _a6 ต่อท้าย ---
-    let original_filename = &req.filename;
-    let a6_filename = original_filename.rfind('.').map_or_else(
-        || format!("{}_a6", original_filename), // กรณีไม่มีนามสกุล
-        |i| {
-            let (name, ext) = original_filename.split_at(i);
-            format!("{}_a6{}", name, ext) // กรณีมีนามสกุล เช่น "invoice.pdf" -> "invoice_a6.pdf"
-        },
-    );
-    let a6_file_path = base_dir.join(&a6_filename);
-    // ---------------------------------------------------------------------
+    // ย้ายการทำงานหนัก (IO & Printing) ไปทำใน Thread Pool เพื่อไม่ให้ Block Main Thread
+    let result = web::block(move || {
+        let base_dir = Path::new("./printable_files");
+        let original_file_path = base_dir.join(&filename);
 
-    if !original_file_path.exists() {
-        return HttpResponse::BadRequest().json(ResponseMessage {
-            status: "error".to_string(),
-            message: format!("File not found: {}", req.filename),
-        });
-    }
+        // --- โค้ดสร้างชื่อไฟล์ A6 ---
+        let original_filename = &filename;
+        let a6_filename = original_filename.rfind('.').map_or_else(
+            || format!("{}_a6", original_filename), 
+            |i| {
+                let (name, ext) = original_filename.split_at(i);
+                format!("{}_a6{}", name, ext) 
+            },
+        );
+        let a6_file_path = base_dir.join(&a6_filename);
+        // ---------------------------------------------------------------------
 
-    // 1. แปลงขนาด PDF เป็น A6 และบันทึกไฟล์ใหม่
-    match resize_pdf_to_a6(&original_file_path, &a6_file_path) {
-        Ok(_) => println!("PDF successfully resized and saved as {}", a6_filename),
-        Err(e) => {
+        if !original_file_path.exists() {
+            return Err((
+                actix_web::http::StatusCode::BAD_REQUEST,
+                ResponseMessage {
+                    status: "error".to_string(),
+                    message: format!("File not found: {}", filename),
+                }
+            ));
+        }
+
+        // 1. แปลงขนาด PDF เป็น A6 และบันทึกไฟล์ใหม่
+        if let Err(e) = resize_pdf_to_a6(&original_file_path, &a6_file_path) {
             eprintln!("Error resizing PDF: {:?}", e);
-            return HttpResponse::InternalServerError().json(ResponseMessage {
-                status: "error".to_string(),
-                message: format!("Failed to resize PDF to A6: {}", e),
-            });
+            return Err((
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseMessage {
+                    status: "error".to_string(),
+                    message: format!("Failed to resize PDF to A6: {}", e),
+                }
+            ));
         }
-    }
+        println!("PDF successfully resized and saved as {}", a6_filename);
 
-    // 2. อ่านไฟล์ A6 ที่สร้างขึ้นใหม่ และสั่งพิมพ์
-    let file_data = match std::fs::read(&a6_file_path) {
-        Ok(data) => data,
+        // 2. อ่านไฟล์ A6
+        let file_data = match std::fs::read(&a6_file_path) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("Error reading A6 file {}: {:?}", a6_filename, e);
+                return Err((
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseMessage {
+                        status: "error".to_string(),
+                        message: format!("Failed to read A6 file {}. Error: {}", a6_filename, e),
+                    }
+                ));
+            }
+        };
+        println!("Successfully read A6 file: {}", a6_filename);
+
+        // 3. สั่งพิมพ์ (ใส่ catch_unwind กันเหนียว เผื่อ Driver Crash)
+        let print_result = std::panic::catch_unwind(|| {
+            match printers::get_printer_by_name(&printer_name) {
+                Some(printer) => {
+                    let options = PrinterJobOptions {
+                        name: Some(&format!("A6 Print Job - {}", filename)),
+                        raw_properties: &[],
+                    };
+                    printer.print(&file_data, options).map_err(|e| format!("{:?}", e))
+                }
+                None => Err(format!("Printer not found: {}", printer_name)),
+            }
+        });
+
+        match print_result {
+            Ok(Ok(_)) => {
+                println!("Print job sent successfully to {}", printer_name);
+                Ok(ResponseMessage {
+                    status: "success".to_string(),
+                    message: format!(
+                        "Resized to A6, saved as {}, and sent to printer {}",
+                        a6_filename, printer_name
+                    ),
+                })
+            }
+            Ok(Err(e)) => {
+                // เช็ค Error message เพื่อแยก 400 กับ 500
+                let status = if e.contains("Printer not found") {
+                    actix_web::http::StatusCode::BAD_REQUEST
+                } else {
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+                };
+                
+                eprintln!("Error sending print job: {}", e);
+                Err((
+                    status,
+                    ResponseMessage {
+                        status: "error".to_string(),
+                        message: e,
+                    }
+                ))
+            }
+            Err(e) => {
+                eprintln!("Panic during printing: {:?}", e);
+                Err((
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseMessage {
+                        status: "error".to_string(),
+                        message: "Internal driver error (panic) during printing".to_string(),
+                    }
+                ))
+            }
+        }
+    }).await;
+
+    // Handle ผลลัพธ์จาก web::block (Async Result)
+    match result {
+        Ok(Ok(response)) => HttpResponse::Ok().json(response),
+        Ok(Err((status_code, response))) => HttpResponse::build(status_code).json(response),
         Err(e) => {
-            eprintln!("Error reading A6 file {}: {:?}", a6_filename, e);
-            return HttpResponse::InternalServerError().json(ResponseMessage {
-                status: "error".to_string(),
-                message: format!("Failed to read A6 file {}. Error: {}", a6_filename, e),
-            });
-        }
-    };
-
-    println!("Successfully read A6 file: {}", a6_filename);
-
-    let printer = match printers::get_printer_by_name(&req.printer_name) {
-        Some(p) => p,
-        None => {
-            return HttpResponse::BadRequest().json(ResponseMessage {
-                status: "error".to_string(),
-                message: format!("Printer not found: {}", req.printer_name),
-            });
-        }
-    };
-
-    let options = PrinterJobOptions {
-        name: Some(&format!("A6 Print Job - {}", req.filename)),
-        raw_properties: &[],
-    };
-
-    match printer.print(&file_data, options) {
-        Ok(_) => {
-            println!("Print job sent successfully to {}", req.printer_name);
-            HttpResponse::Ok().json(ResponseMessage {
-                status: "success".to_string(),
-                message: format!(
-                    "Resized to A6, saved as {}, and sent to printer {}",
-                    a6_filename, req.printer_name
-                ),
-            })
-        }
-        Err(e) => {
-            eprintln!("Error sending print job: {:?}", e);
+            eprintln!("Blocking Error (Server overload or cancelled): {:?}", e);
             HttpResponse::InternalServerError().json(ResponseMessage {
                 status: "error".to_string(),
-                message: format!("Failed to send print job: {:?}", e),
+                message: "Internal Server Error: System overloaded".to_string(),
             })
         }
     }
