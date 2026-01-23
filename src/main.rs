@@ -162,15 +162,26 @@ async fn get_printers() -> impl Responder {
         "note writer",
     ];
 
-    let printers: Vec<String> = printers::get_printers()
-        .into_iter()
-        .map(|p| p.name)
-        .filter(|name| {
-            let name_lower = name.to_lowercase();
-            // Filter out printers that contain any of the virtual printer keywords
-            !virtual_printer_keywords.iter().any(|keyword| name_lower.contains(keyword))
-        })
-        .collect();
+    // ป้องกัน panic โดยใช้ std::panic::catch_unwind
+    let printers_result = std::panic::catch_unwind(|| {
+        printers::get_printers()
+            .into_iter()
+            .map(|p| p.name)
+            .filter(|name| {
+                let name_lower = name.to_lowercase();
+                // Filter out printers that contain any of the virtual printer keywords
+                !virtual_printer_keywords.iter().any(|keyword| name_lower.contains(keyword))
+            })
+            .collect::<Vec<String>>()
+    });
+
+    let printers = match printers_result {
+        Ok(printers_list) => printers_list,
+        Err(e) => {
+            eprintln!("Error getting printers (caught panic): {:?}", e);
+            Vec::new() // Return empty list instead of crashing
+        }
+    };
 
     HttpResponse::Ok().json(PrinterListResponse {
         status: "success".to_string(),
