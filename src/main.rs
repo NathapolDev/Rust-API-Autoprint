@@ -2,13 +2,18 @@ use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
 use anyhow::{bail, Context, Result};
 use lopdf::content::{Content, Operation};
 use lopdf::{Document, Object};
-use printers::{self, common::base::job::PrinterJobOptions};
+use printers;
 use serde::{Deserialize, Serialize};
 
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
+use std::fs::OpenOptions;
+use std::io::Write;
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 use windows_service::{
@@ -58,12 +63,35 @@ struct PrinterListResponse {
     printers: Vec<String>,
 }
 
+/// Helper function to append logs to a file
+fn log_to_file(message: &str) {
+    // Determine the log file path relative to the executable
+    let log_path = std::env::current_exe()
+        .ok()
+        .and_then(|pb| pb.parent().map(|p| p.join("app.log")))
+        .unwrap_or_else(|| Path::new("app.log").to_path_buf());
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        // Add timestamp if possible, or just raw message
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(file, "[{}] {}", timestamp, message);
+    } else {
+        // If we can't write to file, fallback to stderr
+        eprintln!("Failed to write to log file: {}", message);
+    }
+}
+
 // ----------------------------------------------------------------------
 //                        PDF RESIZING LOGIC (WITH SCALING)
 // ----------------------------------------------------------------------
 
 /// แปลงขนาด PDF จากไฟล์ต้นฉบับเป็น A6 และปรับมาตราส่วนเนื้อหา
 fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
+    log_to_file(&format!("Resizing PDF: {} -> {}", input_path.display(), output_path.display()));
     let mut doc = Document::load(input_path)
         .context(format!("Failed to load PDF file: {}", input_path.display()))?;
 
@@ -116,7 +144,83 @@ fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
 }
 
 // ----------------------------------------------------------------------
+//                    PDF RENDERING + WINDOWS GDI PRINTING
+// ----------------------------------------------------------------------
+
+/// พิมพ์ PDF โดยใช้ SumatraPDF portable
+/// วิธีนี้รองรับเครื่องพิมพ์ทุกประเภท รวมถึง Thermal Printer ที่ไม่รองรับ Raw PDF
+/// ต้องวาง SumatraPDF.exe ไว้ในโฟลเดอร์เดียวกับ executable
+fn print_pdf_via_sumatra(pdf_path: &Path, printer_name: &str) -> Result<()> {
+    // 1. ตรวจสอบก่อนว่ามีเครื่องพิมพ์นี้จริงไหม
+    let printer_exists = printers::get_printer_by_name(printer_name).is_some();
+    if !printer_exists {
+        log_to_file(&format!("Printer not found: {}", printer_name));
+        bail!("Printer '{}' not found in system.", printer_name);
+    }
+
+    log_to_file(&format!("Printer found: {}", printer_name));
+
+    // หาตำแหน่ง absolute path ของ PDF
+    let abs_pdf_path = std::fs::canonicalize(pdf_path)
+        .context(format!("Failed to get absolute path for PDF: {}", pdf_path.display()))?;
+
+    // หาตำแหน่งของ executable
+    let exe_path = std::env::current_exe().context("Failed to get executable path")?;
+    let exe_dir = exe_path.parent().context("Failed to get executable directory")?;
+    
+    // ตำแหน่งของ SumatraPDF.exe
+    let sumatra_path = exe_dir.join("SumatraPDF.exe");
+    
+    if !sumatra_path.exists() {
+        bail!("SumatraPDF.exe not found at: {}", sumatra_path.display());
+    }
+    
+    println!("--- Debug Print Job ---");
+    println!("SumatraPath: {}", sumatra_path.display());
+    println!("PrinterName: {}", printer_name);
+    println!("PDF Path:    {}", abs_pdf_path.display());
+    println!("-----------------------");
+    
+    log_to_file(&format!("SumatraPath: {}", sumatra_path.display()));
+    log_to_file(&format!("PDF Path: {}", abs_pdf_path.display()));
+    
+    // เรียก SumatraPDF พร้อม settings เพิ่มเติม
+    // -print-settings "shrink" ช่วยให้เนื้อหาอยู่ในขอบเขตฉลาก
+    let output = std::process::Command::new(&sumatra_path)
+        .arg("-print-to")
+        .arg(printer_name)
+        .arg("-print-settings")
+        .arg("shrink") 
+        .arg("-silent")
+        .arg("-exit-when-done")
+        .arg(&abs_pdf_path)
+        .output()
+        .context("Failed to start SumatraPDF process")?;
+    
+    log_to_file(&format!("SumatraPDF command executed. Status: {:?}", output.status));
+    
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let error_msg = format!(
+            "SumatraPDF failed (Code {:?})\nSTDOUT: {}\nSTDERR: {}",
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
+        );
+        eprintln!("{}", error_msg);
+        log_to_file(&format!("SumatraPDF Error: {}", error_msg));
+        bail!("{}", error_msg);
+    }
+    
+    println!("Success: Print job sent to SumatraPDF.");
+    log_to_file("Success: Print job sent to SumatraPDF.");
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
 //                           API HANDLER (UPDATED)
+// ----------------------------------------------------------------------
 // ----------------------------------------------------------------------
 
 /// กำหนดโครงสร้างเอกสาร OpenAPI
@@ -446,86 +550,131 @@ async fn index() -> HttpResponse {
     )
 )]
 #[post("/api/print")]
-async fn print_file_handler(req: web::Json<PrintRequest>) -> impl Responder {
-    let base_dir = Path::new("./printable_files");
-    let original_file_path = base_dir.join(&req.filename);
+async fn print_file_handler(
+    req: web::Json<PrintRequest>,
+    semaphore: web::Data<Arc<Semaphore>>,
+) -> impl Responder {
+    let filename = req.filename.clone();
+    let printer_name = req.printer_name.clone();
 
-    // --- โค้ดที่เปลี่ยน: สร้างชื่อไฟล์ A6 ถาวร โดยมี _a6 ต่อท้าย ---
-    let original_filename = &req.filename;
-    let a6_filename = original_filename.rfind('.').map_or_else(
-        || format!("{}_a6", original_filename), // กรณีไม่มีนามสกุล
-        |i| {
-            let (name, ext) = original_filename.split_at(i);
-            format!("{}_a6{}", name, ext) // กรณีมีนามสกุล เช่น "invoice.pdf" -> "invoice_a6.pdf"
-        },
-    );
-    let a6_file_path = base_dir.join(&a6_filename);
-    // ---------------------------------------------------------------------
+    // Acquire permit to limit concurrency
+    // If queue is full for more than 30 seconds, return 429 Too Many Requests
+    let _permit = match timeout(Duration::from_secs(30), semaphore.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            log_to_file("Semaphore closed unexpectedly");
+            return HttpResponse::InternalServerError().json(ResponseMessage {
+                status: "error".to_string(),
+                message: "Internal Server Error: Semaphore closed".to_string(),
+            });
+        }
+        Err(_) => {
+            log_to_file(&format!("Request timed out waiting for print queue: {}", filename));
+            return HttpResponse::TooManyRequests().json(ResponseMessage {
+                status: "error".to_string(),
+                message: "Server is busy. Please try again later (Queue timeout).".to_string(),
+            });
+        }
+    };
 
-    if !original_file_path.exists() {
-        return HttpResponse::BadRequest().json(ResponseMessage {
-            status: "error".to_string(),
-            message: format!("File not found: {}", req.filename),
-        });
-    }
+    // ย้ายการทำงานหนัก (IO & Printing) ไปทำใน Thread Pool เพื่อไม่ให้ Block Main Thread
+    let result = web::block(move || {
+        let base_dir = Path::new("./printable_files");
+        let original_file_path = base_dir.join(&filename);
 
-    // 1. แปลงขนาด PDF เป็น A6 และบันทึกไฟล์ใหม่
-    match resize_pdf_to_a6(&original_file_path, &a6_file_path) {
-        Ok(_) => println!("PDF successfully resized and saved as {}", a6_filename),
-        Err(e) => {
+        log_to_file(&format!("Received print request for: {} on printer: {}", filename, printer_name));
+
+        // --- โค้ดสร้างชื่อไฟล์ A6 ---
+        let original_filename = &filename;
+        let a6_filename = original_filename.rfind('.').map_or_else(
+            || format!("{}_a6", original_filename), 
+            |i| {
+                let (name, ext) = original_filename.split_at(i);
+                format!("{}_a6{}", name, ext) 
+            },
+        );
+        let a6_file_path = base_dir.join(&a6_filename);
+        // ---------------------------------------------------------------------
+
+        if !original_file_path.exists() {
+            return Err((
+                actix_web::http::StatusCode::BAD_REQUEST,
+                ResponseMessage {
+                    status: "error".to_string(),
+                    message: format!("File not found: {}", filename),
+                }
+            ));
+        }
+
+        // 1. แปลงขนาด PDF เป็น A6 และบันทึกไฟล์ใหม่
+        if let Err(e) = resize_pdf_to_a6(&original_file_path, &a6_file_path) {
             eprintln!("Error resizing PDF: {:?}", e);
-            return HttpResponse::InternalServerError().json(ResponseMessage {
-                status: "error".to_string(),
-                message: format!("Failed to resize PDF to A6: {}", e),
-            });
+            return Err((
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseMessage {
+                    status: "error".to_string(),
+                    message: format!("Failed to resize PDF to A6: {}", e),
+                }
+            ));
         }
-    }
+        println!("PDF successfully resized and saved as {}", a6_filename);
 
-    // 2. อ่านไฟล์ A6 ที่สร้างขึ้นใหม่ และสั่งพิมพ์
-    let file_data = match std::fs::read(&a6_file_path) {
-        Ok(data) => data,
+        // 2. พิมพ์ผ่าน SumatraPDF (รองรับ Thermal Printer และเครื่องพิมพ์ทุกประเภท)
+        let print_result = std::panic::catch_unwind(|| {
+            print_pdf_via_sumatra(&a6_file_path, &printer_name)
+                .map_err(|e| format!("{}", e))
+        });
+
+        match print_result {
+            Ok(Ok(_)) => {
+                println!("Print job sent successfully to {} via SumatraPDF", printer_name);
+                Ok(ResponseMessage {
+                    status: "success".to_string(),
+                    message: format!(
+                        "Resized to A6, saved as {}, and sent to printer {} via SumatraPDF",
+                        a6_filename, printer_name
+                    ),
+                })
+            }
+            Ok(Err(e)) => {
+                // เช็ค Error message เพื่อแยก 400 กับ 500
+                let status = if e.contains("Printer not found") || e.contains("Failed to create printer DC") {
+                    actix_web::http::StatusCode::BAD_REQUEST
+                } else {
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+                };
+                
+                eprintln!("Error sending print job: {}", e);
+                Err((
+                    status,
+                    ResponseMessage {
+                        status: "error".to_string(),
+                        message: e,
+                    }
+                ))
+            }
+            Err(e) => {
+                eprintln!("Panic during printing: {:?}", e);
+                Err((
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseMessage {
+                        status: "error".to_string(),
+                        message: "Internal driver error (panic) during printing".to_string(),
+                    }
+                ))
+            }
+        }
+    }).await;
+
+    // Handle ผลลัพธ์จาก web::block (Async Result)
+    match result {
+        Ok(Ok(response)) => HttpResponse::Ok().json(response),
+        Ok(Err((status_code, response))) => HttpResponse::build(status_code).json(response),
         Err(e) => {
-            eprintln!("Error reading A6 file {}: {:?}", a6_filename, e);
-            return HttpResponse::InternalServerError().json(ResponseMessage {
-                status: "error".to_string(),
-                message: format!("Failed to read A6 file {}. Error: {}", a6_filename, e),
-            });
-        }
-    };
-
-    println!("Successfully read A6 file: {}", a6_filename);
-
-    let printer = match printers::get_printer_by_name(&req.printer_name) {
-        Some(p) => p,
-        None => {
-            return HttpResponse::BadRequest().json(ResponseMessage {
-                status: "error".to_string(),
-                message: format!("Printer not found: {}", req.printer_name),
-            });
-        }
-    };
-
-    let options = PrinterJobOptions {
-        name: Some(&format!("A6 Print Job - {}", req.filename)),
-        raw_properties: &[],
-    };
-
-    match printer.print(&file_data, options) {
-        Ok(_) => {
-            println!("Print job sent successfully to {}", req.printer_name);
-            HttpResponse::Ok().json(ResponseMessage {
-                status: "success".to_string(),
-                message: format!(
-                    "Resized to A6, saved as {}, and sent to printer {}",
-                    a6_filename, req.printer_name
-                ),
-            })
-        }
-        Err(e) => {
-            eprintln!("Error sending print job: {:?}", e);
+            eprintln!("Blocking Error (Server overload or cancelled): {:?}", e);
             HttpResponse::InternalServerError().json(ResponseMessage {
                 status: "error".to_string(),
-                message: format!("Failed to send print job: {:?}", e),
+                message: "Internal Server Error: System overloaded".to_string(),
             })
         }
     }
@@ -539,6 +688,9 @@ async fn run_app() -> std::io::Result<()> {
     }
 
     let openapi = web::Data::new(ApiDoc::openapi());
+    
+    // Create a global semaphore with 5 permits
+    let semaphore = web::Data::new(Arc::new(Semaphore::new(5)));
 
     println!("Starting server at http://127.0.0.1:3000");
     println!("Swagger UI available at: http://127.0.0.1:3000/swagger-ui/");
@@ -546,6 +698,7 @@ async fn run_app() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(openapi.clone())
+            .app_data(semaphore.clone())
             .service(index)
             .service(get_printers)
             .service(print_file_handler)
