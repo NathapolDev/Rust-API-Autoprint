@@ -89,11 +89,69 @@ fn log_to_file(message: &str) {
 //                        PDF RESIZING LOGIC (WITH SCALING)
 // ----------------------------------------------------------------------
 
+// 4x6 inches: 101.6mm x 152.4mm
+const LABEL_4_INCH_PTS: f32 = 288.0;
+const LABEL_6_INCH_PTS: f32 = 432.0;
+
 /// แปลงขนาด PDF จากไฟล์ต้นฉบับเป็น A6 และปรับมาตราส่วนเนื้อหา
 fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
-    log_to_file(&format!("Resizing PDF: {} -> {}", input_path.display(), output_path.display()));
+    log_to_file(&format!("Processing PDF: {} -> {}", input_path.display(), output_path.display()));
     let mut doc = Document::load(input_path)
         .context(format!("Failed to load PDF file: {}", input_path.display()))?;
+
+    // Check if the first page is already approximately A6 or 4x6 inch
+    if let Some(page_id) = doc.get_pages().values().next() {
+        if let Ok(page) = doc.get_dictionary(*page_id) {
+            // Note: If MediaBox is a Reference, we might need to resolve it. 
+            // But if we got into the array match effectively, it is likely a direct array 
+            // or lopdf handled it (though usually it doesn't auto-resolve on get).
+            // For now, assume it works as previous log showed 0.00 dimensions, meaning it entered the block.
+            if let Ok(media_box) = page.get(b"MediaBox").and_then(|obj| obj.as_array()) {
+                 if media_box.len() == 4 {
+                    log_to_file(&format!("Raw MediaBox: {:?}", media_box));
+
+                    let extract_val = |obj: &Object| -> f32 {
+                        match obj {
+                            Object::Real(v) => *v, // Assuming f32 based on usage
+                            Object::Integer(v) => *v as f32,
+                            _ => 0.0,
+                        }
+                    };
+
+                    let x0 = extract_val(&media_box[0]);
+                    let y0 = extract_val(&media_box[1]);
+                    let x1 = extract_val(&media_box[2]);
+                    let y1 = extract_val(&media_box[3]);
+                    
+                    let width = (x1 - x0).abs();
+                    let height = (y1 - y0).abs();
+                    
+                    log_to_file(&format!("Detected PDF Dimensions: {:.2} x {:.2} pts", width, height));
+
+                    // Tolerance for floating point comparison (e.g., 5 points ~ 1.7mm)
+                    let tolerance = 5.0;
+                    
+                    // Check A6
+                    let is_a6_portrait = (width - A6_WIDTH_PTS).abs() < tolerance && (height - A6_HEIGHT_PTS).abs() < tolerance;
+                    let is_a6_landscape = (width - A6_HEIGHT_PTS).abs() < tolerance && (height - A6_WIDTH_PTS).abs() < tolerance;
+
+                    // Check 4x6 inch
+                    let is_4x6_portrait = (width - LABEL_4_INCH_PTS).abs() < tolerance && (height - LABEL_6_INCH_PTS).abs() < tolerance;
+                    let is_4x6_landscape = (width - LABEL_6_INCH_PTS).abs() < tolerance && (height - LABEL_4_INCH_PTS).abs() < tolerance;
+
+                    if is_a6_portrait || is_a6_landscape || is_4x6_portrait || is_4x6_landscape {
+                        log_to_file("PDF is already A6 or 4x6 inch. Skipping resize (direct copy).");
+                         // Use fs::copy to ensure bit-exact copy without re-serialization
+                         std::fs::copy(input_path, output_path)
+                            .context(format!("Failed to copy original PDF file: {}", output_path.display()))?;
+                        return Ok(());
+                    } else {
+                        log_to_file("PDF dimensions do not match A6 or 4x6. Proceeding with resize.");
+                    }
+                 }
+            }
+        }
+    }
 
     // คำนวณ Scale Factor (สมมติ A4 เป็นขนาดตั้งต้น)
     let scale_x = A6_WIDTH_PTS / A4_WIDTH_PTS;
