@@ -6,12 +6,12 @@ use printers;
 use serde::{Deserialize, Serialize};
 
 use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
-use std::fs::OpenOptions;
-use std::io::Write;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use utoipa::{OpenApi, ToSchema};
@@ -49,6 +49,27 @@ struct PrintRequest {
     printer_name: String,
 }
 
+impl PrintRequest {
+    fn validate(&self) -> Result<()> {
+        if self.filename.trim().is_empty() {
+            bail!("filename cannot be empty");
+        }
+        if self.printer_name.trim().is_empty() {
+            bail!("printer_name cannot be empty");
+        }
+
+        let file_path = Path::new(&self.filename);
+        if file_path.is_absolute() || self.filename.contains("..") {
+            bail!("filename must be a relative filename under printable_files");
+        }
+
+        match file_path.extension().and_then(|ext| ext.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("pdf") => Ok(()),
+            _ => bail!("filename must be a .pdf file"),
+        }
+    }
+}
+
 /// โครงสร้างสำหรับ Response ที่ส่งกลับไปให้ Client
 #[derive(Serialize, ToSchema)]
 struct ResponseMessage {
@@ -71,11 +92,7 @@ fn log_to_file(message: &str) {
         .and_then(|pb| pb.parent().map(|p| p.join("app.log")))
         .unwrap_or_else(|| Path::new("app.log").to_path_buf());
 
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
         // Add timestamp if possible, or just raw message
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         let _ = writeln!(file, "[{}] {}", timestamp, message);
@@ -91,7 +108,11 @@ fn log_to_file(message: &str) {
 
 /// แปลงขนาด PDF จากไฟล์ต้นฉบับเป็น A6 และปรับมาตราส่วนเนื้อหา
 fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
-    log_to_file(&format!("Resizing PDF: {} -> {}", input_path.display(), output_path.display()));
+    log_to_file(&format!(
+        "Resizing PDF: {} -> {}",
+        input_path.display(),
+        output_path.display()
+    ));
     let mut doc = Document::load(input_path)
         .context(format!("Failed to load PDF file: {}", input_path.display()))?;
 
@@ -137,8 +158,10 @@ fn resize_pdf_to_a6(input_path: &Path, output_path: &Path) -> Result<()> {
         doc.change_page_content(page_id, new_content)?;
     }
 
-    doc.save(output_path)
-        .context(format!("Failed to save new A6 PDF file: {}", output_path.display()))?;
+    doc.save(output_path).context(format!(
+        "Failed to save new A6 PDF file: {}",
+        output_path.display()
+    ))?;
 
     Ok(())
 }
@@ -161,44 +184,51 @@ fn print_pdf_via_sumatra(pdf_path: &Path, printer_name: &str) -> Result<()> {
     log_to_file(&format!("Printer found: {}", printer_name));
 
     // หาตำแหน่ง absolute path ของ PDF
-    let abs_pdf_path = std::fs::canonicalize(pdf_path)
-        .context(format!("Failed to get absolute path for PDF: {}", pdf_path.display()))?;
+    let abs_pdf_path = std::fs::canonicalize(pdf_path).context(format!(
+        "Failed to get absolute path for PDF: {}",
+        pdf_path.display()
+    ))?;
 
     // หาตำแหน่งของ executable
     let exe_path = std::env::current_exe().context("Failed to get executable path")?;
-    let exe_dir = exe_path.parent().context("Failed to get executable directory")?;
-    
+    let exe_dir = exe_path
+        .parent()
+        .context("Failed to get executable directory")?;
+
     // ตำแหน่งของ SumatraPDF.exe
     let sumatra_path = exe_dir.join("SumatraPDF.exe");
-    
+
     if !sumatra_path.exists() {
         bail!("SumatraPDF.exe not found at: {}", sumatra_path.display());
     }
-    
+
     println!("--- Debug Print Job ---");
     println!("SumatraPath: {}", sumatra_path.display());
     println!("PrinterName: {}", printer_name);
     println!("PDF Path:    {}", abs_pdf_path.display());
     println!("-----------------------");
-    
+
     log_to_file(&format!("SumatraPath: {}", sumatra_path.display()));
     log_to_file(&format!("PDF Path: {}", abs_pdf_path.display()));
-    
+
     // เรียก SumatraPDF พร้อม settings เพิ่มเติม
     // -print-settings "shrink" ช่วยให้เนื้อหาอยู่ในขอบเขตฉลาก
     let output = std::process::Command::new(&sumatra_path)
         .arg("-print-to")
         .arg(printer_name)
         .arg("-print-settings")
-        .arg("shrink") 
+        .arg("shrink")
         .arg("-silent")
         .arg("-exit-when-done")
         .arg(&abs_pdf_path)
         .output()
         .context("Failed to start SumatraPDF process")?;
-    
-    log_to_file(&format!("SumatraPDF command executed. Status: {:?}", output.status));
-    
+
+    log_to_file(&format!(
+        "SumatraPDF command executed. Status: {:?}",
+        output.status
+    ));
+
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -212,7 +242,7 @@ fn print_pdf_via_sumatra(pdf_path: &Path, printer_name: &str) -> Result<()> {
         log_to_file(&format!("SumatraPDF Error: {}", error_msg));
         bail!("{}", error_msg);
     }
-    
+
     println!("Success: Print job sent to SumatraPDF.");
     log_to_file("Success: Print job sent to SumatraPDF.");
     Ok(())
@@ -274,7 +304,9 @@ async fn get_printers() -> impl Responder {
             .filter(|name| {
                 let name_lower = name.to_lowercase();
                 // Filter out printers that contain any of the virtual printer keywords
-                !virtual_printer_keywords.iter().any(|keyword| name_lower.contains(keyword))
+                !virtual_printer_keywords
+                    .iter()
+                    .any(|keyword| name_lower.contains(keyword))
             })
             .collect::<Vec<String>>()
     });
@@ -535,7 +567,9 @@ async fn index() -> HttpResponse {
 </body>
 </html>
     "#.to_string();
-    HttpResponse::Ok().content_type("text/html").body(html_content)
+    HttpResponse::Ok()
+        .content_type("text/html")
+        .body(html_content)
 }
 
 #[utoipa::path(
@@ -554,6 +588,13 @@ async fn print_file_handler(
     req: web::Json<PrintRequest>,
     semaphore: web::Data<Arc<Semaphore>>,
 ) -> impl Responder {
+    if let Err(e) = req.validate() {
+        return HttpResponse::BadRequest().json(ResponseMessage {
+            status: "error".to_string(),
+            message: format!("Invalid request: {}", e),
+        });
+    }
+
     let filename = req.filename.clone();
     let printer_name = req.printer_name.clone();
 
@@ -569,7 +610,10 @@ async fn print_file_handler(
             });
         }
         Err(_) => {
-            log_to_file(&format!("Request timed out waiting for print queue: {}", filename));
+            log_to_file(&format!(
+                "Request timed out waiting for print queue: {}",
+                filename
+            ));
             return HttpResponse::TooManyRequests().json(ResponseMessage {
                 status: "error".to_string(),
                 message: "Server is busy. Please try again later (Queue timeout).".to_string(),
@@ -582,15 +626,18 @@ async fn print_file_handler(
         let base_dir = Path::new("./printable_files");
         let original_file_path = base_dir.join(&filename);
 
-        log_to_file(&format!("Received print request for: {} on printer: {}", filename, printer_name));
+        log_to_file(&format!(
+            "Received print request for: {} on printer: {}",
+            filename, printer_name
+        ));
 
         // --- โค้ดสร้างชื่อไฟล์ A6 ---
         let original_filename = &filename;
         let a6_filename = original_filename.rfind('.').map_or_else(
-            || format!("{}_a6", original_filename), 
+            || format!("{}_a6", original_filename),
             |i| {
                 let (name, ext) = original_filename.split_at(i);
-                format!("{}_a6{}", name, ext) 
+                format!("{}_a6{}", name, ext)
             },
         );
         let a6_file_path = base_dir.join(&a6_filename);
@@ -602,7 +649,7 @@ async fn print_file_handler(
                 ResponseMessage {
                     status: "error".to_string(),
                     message: format!("File not found: {}", filename),
-                }
+                },
             ));
         }
 
@@ -614,20 +661,22 @@ async fn print_file_handler(
                 ResponseMessage {
                     status: "error".to_string(),
                     message: format!("Failed to resize PDF to A6: {}", e),
-                }
+                },
             ));
         }
         println!("PDF successfully resized and saved as {}", a6_filename);
 
         // 2. พิมพ์ผ่าน SumatraPDF (รองรับ Thermal Printer และเครื่องพิมพ์ทุกประเภท)
         let print_result = std::panic::catch_unwind(|| {
-            print_pdf_via_sumatra(&a6_file_path, &printer_name)
-                .map_err(|e| format!("{}", e))
+            print_pdf_via_sumatra(&a6_file_path, &printer_name).map_err(|e| format!("{}", e))
         });
 
         match print_result {
             Ok(Ok(_)) => {
-                println!("Print job sent successfully to {} via SumatraPDF", printer_name);
+                println!(
+                    "Print job sent successfully to {} via SumatraPDF",
+                    printer_name
+                );
                 Ok(ResponseMessage {
                     status: "success".to_string(),
                     message: format!(
@@ -638,19 +687,21 @@ async fn print_file_handler(
             }
             Ok(Err(e)) => {
                 // เช็ค Error message เพื่อแยก 400 กับ 500
-                let status = if e.contains("Printer not found") || e.contains("Failed to create printer DC") {
+                let status = if e.contains("Printer not found")
+                    || e.contains("Failed to create printer DC")
+                {
                     actix_web::http::StatusCode::BAD_REQUEST
                 } else {
                     actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
                 };
-                
+
                 eprintln!("Error sending print job: {}", e);
                 Err((
                     status,
                     ResponseMessage {
                         status: "error".to_string(),
                         message: e,
-                    }
+                    },
                 ))
             }
             Err(e) => {
@@ -660,11 +711,12 @@ async fn print_file_handler(
                     ResponseMessage {
                         status: "error".to_string(),
                         message: "Internal driver error (panic) during printing".to_string(),
-                    }
+                    },
                 ))
             }
         }
-    }).await;
+    })
+    .await;
 
     // Handle ผลลัพธ์จาก web::block (Async Result)
     match result {
@@ -688,12 +740,21 @@ async fn run_app() -> std::io::Result<()> {
     }
 
     let openapi = web::Data::new(ApiDoc::openapi());
-    
+
     // Create a global semaphore with 5 permits
     let semaphore = web::Data::new(Arc::new(Semaphore::new(5)));
 
-    println!("Starting server at http://127.0.0.1:3000");
-    println!("Swagger UI available at: http://127.0.0.1:3000/swagger-ui/");
+    let host = std::env::var("RUST_PRINT_API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = std::env::var("RUST_PRINT_API_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(3000);
+
+    println!("Starting server at http://{}:{}", host, port);
+    println!(
+        "Swagger UI available at: http://{}:{}/swagger-ui/",
+        host, port
+    );
 
     HttpServer::new(move || {
         App::new()
@@ -707,7 +768,7 @@ async fn run_app() -> std::io::Result<()> {
                     .url("/api-docs/openapi.json", openapi.get_ref().clone()),
             )
     })
-    .bind(("127.0.0.1", 3000))?
+    .bind((host.as_str(), port))?
     .run()
     .await
 }
