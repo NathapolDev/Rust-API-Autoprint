@@ -13,6 +13,8 @@
 *   **API Documentation:** มาพร้อมกับ Swagger UI (OpenAPI Specification) สำหรับการทดสอบและดูเอกสารผ่านเว็บเบราว์เซอร์
 *   **Windows Service Support:** สามารถติดตั้งและรันเป็น Windows Service ได้ ทำให้แอปพลิเคชันทำงานอยู่เบื้องหลังได้อย่างต่อเนื่อง
 *   **Health Check Endpoint:** มี `GET /` endpoint สำหรับตรวจสอบสถานะการทำงานของ Service โดยจะแสดงหน้า HTML อย่างง่าย
+*   **Input Validation:** ตรวจสอบคำขอพิมพ์ให้ปลอดภัยขึ้น โดยบังคับให้ `filename` เป็นไฟล์ `.pdf` แบบ relative path เท่านั้น (ป้องกัน path traversal)
+*   **Configurable Host/Port:** กำหนดค่า API ผ่าน Environment Variables ได้ (`RUST_PRINT_API_HOST`, `RUST_PRINT_API_PORT`)
 
 ---
 
@@ -63,6 +65,11 @@ cargo run -- --console
 ```
 เมื่อรันแล้ว API จะพร้อมใช้งานที่ `http://127.0.0.1:8080` และ Swagger UI ที่ `http://127.0.0.1:8080/swagger-ui/`
 
+> หมายเหตุ: ค่าเริ่มต้นปัจจุบันของโปรเจกต์คือ `127.0.0.1:3000`  
+> สามารถเปลี่ยนได้ด้วย:
+> - `RUST_PRINT_API_HOST` (default: `127.0.0.1`)
+> - `RUST_PRINT_API_PORT` (default: `3000`)
+
 ### 2. API Endpoints
 
 *   **GET /**
@@ -77,6 +84,11 @@ cargo run -- --console
             "printer_name": "Your_Printer_Name"
         }
         ```
+    *   **Validation Rules:**
+        * `filename` ต้องไม่ว่าง
+        * `filename` ต้องเป็นไฟล์นามสกุล `.pdf`
+        * `filename` ต้องเป็น relative filename (ห้าม absolute path และห้ามมี `..`)
+        * `printer_name` ต้องไม่ว่าง
     *   **Response (JSON):**
         ```json
         {
